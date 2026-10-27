@@ -1,26 +1,100 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/*
+ * 60-30-10 palette per theme:
+ *   60% --bg       dominant canvas
+ *   30% --surface  header, input bar, Mossy's bubbles
+ *   10% --accent   user bubbles, send button, focus rings
+ */
+
+/* Dark (default) */
+:root,
+[data-theme="dark"] {
+  --bg: #0f1115;
+  --surface: #1a1d24;
+  --accent: #8aa4c8;
+  --accent-fg: #0f1115;
+  --text: #e6e8eb;
+  --muted: #8b93a1;
+  --border: #262a33;
+}
+
+[data-theme="light"] {
+  --bg: #f8f9fb;
+  --surface: #eceff3;
+  --accent: #46638c;
+  --accent-fg: #ffffff;
+  --text: #1c2129;
+  --muted: #646d7a;
+  --border: #dde1e7;
+}
+
+[data-theme="ocean"] {
+  --bg: #04121f;
+  --surface: #0b2338;
+  --accent: #2dd4bf;
+  --accent-fg: #04121f;
+  --text: #d7e9f5;
+  --muted: #7d9bb3;
+  --border: #12304a;
+}
+
+[data-theme="shore"] {
+  --bg: #f7f1e6;
+  --surface: #dff0ef;
+  --accent: #0b8aa3;
+  --accent-fg: #ffffff;
+  --text: #1d3a44;
+  --muted: #5f7a80;
+  --border: #e4d9c4;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+body {
+  background: var(--bg);
+  color: var(--text);
+  transition: background-color 0.2s, color 0.2s;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+.markdown > * + * {
+  margin-top: 0.6em;
+}
+.markdown ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+}
+.markdown ol {
+  list-style: decimal;
+  padding-left: 1.25rem;
+}
+.markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--bg);
+  padding: 0.1em 0.35em;
+  border-radius: 0.25rem;
+}
+.markdown pre {
+  background: var(--bg);
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+}
+.markdown pre code {
+  padding: 0;
 }
