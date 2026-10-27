@@ -71,7 +71,13 @@ export default function Chat() {
     const text = input.trim();
     if (!text || loading) return;
 
-    setMessages((prev) => [...prev, newMessage("user", text)]);
+    const userMsg = newMessage("user", text);
+    // Error bubbles are UI-only; never send them to the model.
+    const history = [...messages, userMsg]
+      .filter((m) => !m.error)
+      .map(({ role, content }) => ({ role, content }));
+
+    setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setLoading(true);
 
@@ -79,9 +85,13 @@ export default function Chat() {
       const res = await fetch(`${API_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ messages: history }),
       });
-      if (!res.ok) throw new Error(`Request failed (${res.status})`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        const detail = typeof body?.detail === "string" ? body.detail : "";
+        throw new Error(`Request failed (${res.status}) ${detail}`.trim());
+      }
       const data: { reply: string } = await res.json();
       setMessages((prev) => [...prev, newMessage("assistant", data.reply)]);
     } catch (err) {
