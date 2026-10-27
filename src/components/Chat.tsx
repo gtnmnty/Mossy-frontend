@@ -48,6 +48,52 @@ function newMessage(role: Role, content: string, error = false): Message {
   return { id: crypto.randomUUID(), role, content, createdAt: Date.now(), error };
 }
 
+// Feature 3: Streaming: POSTs the history and reads the SSE response as it arrives,
+// calling onDelta for every text chunk. (EventSource can't be used: it only supports GET.)
+async function streamChat(history: { role: Role; content: string }[], onDelta: (text: string) => void) {
+  const res = await fetch(`${API_URL}/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages: history }),
+  });
+  // Validation errors (422) etc. come back as a normal JSON response before any streaming.
+  if (!res.ok || !res.body) {
+    const body = await res.json().catch(() => null);
+    const detail = typeof body?.detail === "string" ? body.detail : "";
+    throw new Error(`Request failed (${res.status}) ${detail}`.trim());
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = ""; // text received but not yet split into complete events
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    // { stream: true } keeps multi-byte characters that were split across chunks intact.
+    buf += decoder.decode(value, { stream: true });
+    // sse-starlette ends lines with \r\n; normalise so we can split on a blank line ("\n\n").
+    buf = buf.replace(/\r\n/g, "\n");
+
+    // A network chunk can hold several events or half of one: split on the blank line
+    // between events and keep the last (possibly incomplete) piece for the next read.
+    const events = buf.split("\n\n");
+    buf = events.pop() ?? "";
+
+    for (const ev of events) {
+      const name = /^event: (.*)$/m.exec(ev)?.[1]?.trim();
+      const data = /^data: (.*)$/m.exec(ev)?.[1];
+      if (!data) continue; // keep-alive pings have no data line
+
+      if (name === "delta") onDelta(JSON.parse(data).text);
+      // The server reports mid-stream failures as an event, not an HTTP status.
+      else if (name === "error") throw new Error(JSON.parse(data).message);
+      // "done" carries token usage; nothing to do with it yet.
+    }
+  }
+}
+
 export default function Chat() {
   const [messages, setMessages] = useState<Message[]>(loadMessages);
   const [theme, setTheme] = useState<Theme>(loadTheme);
@@ -57,7 +103,8 @@ export default function Chat() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    sessionStorage.setItem(MESSAGES_KEY, JSON.stringify(messages));
+    // Save only when no reply is streaming, so a half-written answer is never stored.
+    if (!loading) sessionStorage.setItem(MESSAGES_KEY, JSON.stringify(messages));
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
@@ -77,29 +124,33 @@ export default function Chat() {
       .filter((m) => !m.error)
       .map(({ role, content }) => ({ role, content }));
 
-    setMessages((prev) => [...prev, userMsg]);
+    // Push an empty assistant bubble now; each streamed chunk is appended to it by id.
+    const botMsg = newMessage("assistant", "");
+    setMessages((prev) => [...prev, userMsg, botMsg]);
     setInput("");
     setLoading(true);
 
     try {
-      const res = await fetch(`${API_URL}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        const detail = typeof body?.detail === "string" ? body.detail : "";
-        throw new Error(`Request failed (${res.status}) ${detail}`.trim());
-      }
-      const data: { reply: string } = await res.json();
-      setMessages((prev) => [...prev, newMessage("assistant", data.reply)]);
+      await streamChat(history, (chunk) =>
+        // Immutable update: copy the array and replace only the streaming message.
+        setMessages((prev) =>
+          prev.map((m) => (m.id === botMsg.id ? { ...m, content: m.content + chunk } : m)),
+        ),
+      );
     } catch (err) {
       const reason = err instanceof Error ? err.message : "Unknown error";
-      setMessages((prev) => [
-        ...prev,
-        newMessage("assistant", `Sorry, I couldn't reach the server. ${reason}`, true),
-      ]);
+      // Fill the existing bubble (keeping any partial text) instead of adding a second one.
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === botMsg.id
+            ? {
+                ...m,
+                error: true,
+                content: `${m.content}${m.content ? "\n\n" : ""}Sorry, I couldn't reach the server. ${reason}`,
+              }
+            : m,
+        ),
+      );
     } finally {
       setLoading(false);
       inputRef.current?.focus();
@@ -157,7 +208,8 @@ export default function Chat() {
           )}
 
           {messages.map((m) =>
-            m.role === "user" ? (
+            // The empty streaming bubble stays hidden; the typing dots below stand in for it.
+            m.role === "assistant" && !m.content ? null : m.role === "user" ? (
               <div key={m.id} className="flex justify-end">
                 <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-accent px-4 py-2.5 text-[15px] text-accent-fg">
                   {m.content}
@@ -198,7 +250,8 @@ export default function Chat() {
             ),
           )}
 
-          {loading && (
+          {/* Dots show only until the first chunk arrives (last message still empty). */}
+          {loading && !messages[messages.length - 1]?.content && (
             <div className="flex items-start gap-3">
               <Image src="/logo.png" alt="Mossy" width={28} height={28} className="mt-1 shrink-0" />
               <div className="flex gap-1 rounded-2xl rounded-tl-sm bg-surface px-4 py-4">
