@@ -48,9 +48,20 @@ function newMessage(role: Role, content: string, error = false): Message {
   return { id: crypto.randomUUID(), role, content, createdAt: Date.now(), error };
 }
 
+// Feature 5: Tools: friendly text shown while Mossy waits for a tool result.
+const TOOL_LABELS: Record<string, string> = {
+  get_current_time: "Checking the time",
+  get_marine_weather: "Checking the waves",
+};
+
 // Feature 3: Streaming: POSTs the history and reads the SSE response as it arrives,
-// calling onDelta for every text chunk. (EventSource can't be used: it only supports GET.)
-async function streamChat(history: { role: Role; content: string }[], onDelta: (text: string) => void) {
+// calling onDelta for every text chunk and onTool when Mossy starts using a tool.
+// (EventSource can't be used: it only supports GET.)
+async function streamChat(
+  history: { role: Role; content: string }[],
+  onDelta: (text: string) => void,
+  onTool: (name: string) => void,
+) {
   const res = await fetch(`${API_URL}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -87,6 +98,8 @@ async function streamChat(history: { role: Role; content: string }[], onDelta: (
       if (!data) continue; // keep-alive pings have no data line
 
       if (name === "delta") onDelta(JSON.parse(data).text);
+      // Feature 5: the server sends "tool" with the tool's name before running it.
+      else if (name === "tool") onTool(JSON.parse(data).name);
       // The server reports mid-stream failures as an event, not an HTTP status.
       else if (name === "error") throw new Error(JSON.parse(data).message);
       // "done" carries token usage; nothing to do with it yet.
@@ -99,6 +112,7 @@ export default function Chat() {
   const [theme, setTheme] = useState<Theme>(loadTheme);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [toolStatus, setToolStatus] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -119,9 +133,10 @@ export default function Chat() {
     if (!text || loading) return;
 
     const userMsg = newMessage("user", text);
-    // Error bubbles are UI-only; never send them to the model.
+    // Feature 1: Multi-turn history: Claude has no memory, so the whole chat is sent each time.
+    // Error bubbles are UI-only, and empty ones would fail the backend's min_length check.
     const history = [...messages, userMsg]
-      .filter((m) => !m.error)
+      .filter((m) => !m.error && m.content)
       .map(({ role, content }) => ({ role, content }));
 
     // Push an empty assistant bubble now; each streamed chunk is appended to it by id.
@@ -131,11 +146,16 @@ export default function Chat() {
     setLoading(true);
 
     try {
-      await streamChat(history, (chunk) =>
-        // Immutable update: copy the array and replace only the streaming message.
-        setMessages((prev) =>
-          prev.map((m) => (m.id === botMsg.id ? { ...m, content: m.content + chunk } : m)),
-        ),
+      await streamChat(
+        history,
+        (chunk) => {
+          setToolStatus(null);
+          // Immutable update: copy the array and replace only the streaming message.
+          setMessages((prev) =>
+            prev.map((m) => (m.id === botMsg.id ? { ...m, content: m.content + chunk } : m)),
+          );
+        },
+        (name) => setToolStatus(TOOL_LABELS[name] ?? `Using ${name}`),
       );
     } catch (err) {
       const reason = err instanceof Error ? err.message : "Unknown error";
@@ -153,6 +173,7 @@ export default function Chat() {
       );
     } finally {
       setLoading(false);
+      setToolStatus(null);
       inputRef.current?.focus();
     }
   }
@@ -251,10 +272,12 @@ export default function Chat() {
           )}
 
           {/* Dots show only until the first chunk arrives (last message still empty). */}
-          {loading && !messages[messages.length - 1]?.content && (
+          {/* Typing dots before the first words, and again (with a label) while a tool runs. */}
+          {loading && (toolStatus || !messages[messages.length - 1]?.content) && (
             <div className="flex items-start gap-3">
               <Image src="/logo.png" alt="Mossy" width={28} height={28} className="mt-1 shrink-0" />
-              <div className="flex gap-1 rounded-2xl rounded-tl-sm bg-surface px-4 py-4">
+              <div className="flex items-center gap-1 rounded-2xl rounded-tl-sm bg-surface px-4 py-4">
+                {toolStatus && <span className="mr-2 text-sm text-muted">{toolStatus}…</span>}
                 {[0, 150, 300].map((delay) => (
                   <span
                     key={delay}
