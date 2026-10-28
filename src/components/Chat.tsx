@@ -32,6 +32,7 @@ const THEMES: { value: Theme; label: string }[] = [
 
 const MESSAGES_KEY = "mossy:messages";
 const THEME_KEY = "mossy:theme";
+const TITLE_KEY = "mossy:title"; // Feature 8
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 function loadMessages(): Message[] {
@@ -45,6 +46,10 @@ function loadMessages(): Message[] {
 function loadTheme(): Theme {
   const saved = sessionStorage.getItem(THEME_KEY) as Theme | null;
   return THEMES.some((t) => t.value === saved) ? saved! : "dark";
+}
+
+function loadTitle(): string | null {
+  return sessionStorage.getItem(TITLE_KEY);
 }
 
 function newMessage(role: Role, content: string, error = false): Message {
@@ -113,6 +118,28 @@ async function streamChat(
   }
 }
 
+// Feature 8: Structured outputs (title and follow-ups)
+interface ChatMeta {
+  title: string;
+  followups: string[];
+}
+
+// A small side call made after a reply finishes, never while it streams. If it fails for
+// any reason (network, a non-200), this just returns null and the UI keeps whatever title
+// and follow-ups it already had — a broken title call should never break the chat.
+async function fetchMeta(history: { role: Role; content: string }[]): Promise<ChatMeta | null> {
+  try {
+    const res = await fetch(`${API_URL}/chat/meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: history }),
+    });
+    return res.ok ? ((await res.json()) as ChatMeta) : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function Chat() {
   const [messages, setMessages] = useState<Message[]>(loadMessages);
   const [theme, setTheme] = useState<Theme>(loadTheme);
@@ -120,6 +147,8 @@ export default function Chat() {
   const [loading, setLoading] = useState(false);
   const [toolStatus, setToolStatus] = useState<string | null>(null);
   const [think, setThink] = useState(false); // Feature 7: "Think harder" toggle
+  const [title, setTitle] = useState<string | null>(loadTitle); // Feature 8
+  const [followups, setFollowups] = useState<string[]>([]); // Feature 8
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -134,10 +163,23 @@ export default function Chat() {
     sessionStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
-  async function send(e?: FormEvent) {
-    e?.preventDefault();
-    const text = input.trim();
+  // Feature 8: keeps the title in session storage and the browser tab in sync.
+  useEffect(() => {
+    if (title) sessionStorage.setItem(TITLE_KEY, title);
+    document.title = title ? `${title} · Mossy` : "Mossy";
+  }, [title]);
+
+  function clearChat() {
+    setMessages([]);
+    setTitle(null);
+    setFollowups([]);
+    sessionStorage.removeItem(TITLE_KEY);
+  }
+
+  // Shared by the form submit and by clicking a follow-up suggestion.
+  async function sendText(text: string) {
     if (!text || loading) return;
+    setFollowups([]); // this turn's suggestions are about to be replaced
 
     const userMsg = newMessage("user", text);
     // Feature 1: Multi-turn history: Claude has no memory, so the whole chat is sent each time.
@@ -149,8 +191,9 @@ export default function Chat() {
     // Push an empty assistant bubble now; each streamed chunk is appended to it by id.
     const botMsg = newMessage("assistant", "");
     setMessages((prev) => [...prev, userMsg, botMsg]);
-    setInput("");
     setLoading(true);
+
+    let replyText = ""; // mirrors botMsg.content locally, since state updates are async
 
     try {
       await streamChat(history, think, {
@@ -164,6 +207,7 @@ export default function Chat() {
         },
         delta: (chunk) => {
           setToolStatus(null);
+          replyText += chunk;
           // Immutable update: copy the array and replace only the streaming message.
           setMessages((prev) =>
             prev.map((m) => (m.id === botMsg.id ? { ...m, content: m.content + chunk } : m)),
@@ -171,6 +215,17 @@ export default function Chat() {
         },
         tool: (name) => setToolStatus(TOOL_LABELS[name] ?? `Using ${name}`),
       });
+
+      // Feature 8: fire-and-forget. Never awaited, so a slow or failed title call can't
+      // delay re-enabling the input below. Title is set only once per conversation;
+      // follow-ups are replaced after every reply.
+      if (replyText) {
+        fetchMeta([...history, { role: "assistant", content: replyText }]).then((meta) => {
+          if (!meta) return;
+          setTitle((prev) => prev ?? meta.title);
+          setFollowups(meta.followups ?? []);
+        });
+      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : "Unknown error";
       // Fill the existing bubble (keeping any partial text) instead of adding a second one.
@@ -192,6 +247,14 @@ export default function Chat() {
     }
   }
 
+  function send(e?: FormEvent) {
+    e?.preventDefault();
+    const text = input.trim();
+    if (!text || loading) return; // guard here too, so a draft isn't cleared while busy
+    setInput("");
+    sendText(text);
+  }
+
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -202,9 +265,11 @@ export default function Chat() {
   return (
     <div className="flex h-dvh flex-col bg-bg text-text">
       <header className="flex items-center justify-between gap-3 border-b border-border bg-surface px-4 py-3">
-        <div className="flex items-center gap-2.5">
-          <Image src="/logo.png" alt="Mossy" width={32} height={32} priority />
-          <span className="text-base font-semibold tracking-tight">Mossy</span>
+        <div className="flex min-w-0 items-center gap-2.5">
+          <Image src="/logo.png" alt="Mossy" width={32} height={32} priority className="shrink-0" />
+          <span className="shrink-0 text-base font-semibold tracking-tight">Mossy</span>
+          {/* Feature 8: the conversation's title, once Claude has made one. */}
+          {title && <span className="truncate text-sm text-muted">· {title}</span>}
         </div>
         <div className="flex items-center gap-2">
           <select
@@ -221,7 +286,7 @@ export default function Chat() {
           </select>
           <button
             type="button"
-            onClick={() => setMessages([])}
+            onClick={clearChat}
             disabled={messages.length === 0}
             aria-label="Clear chat"
             title="Clear chat"
@@ -314,6 +379,22 @@ export default function Chat() {
                   />
                 ))}
               </div>
+            </div>
+          )}
+
+          {/* Feature 8: clickable follow-up questions suggested after Mossy's last reply. */}
+          {!loading && followups.length > 0 && (
+            <div className="ml-10 flex flex-wrap gap-2">
+              {followups.map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  onClick={() => sendText(q)}
+                  className="rounded-full border border-border px-3 py-1.5 text-sm text-muted transition-colors hover:border-accent hover:text-text"
+                >
+                  {q}
+                </button>
+              ))}
             </div>
           )}
           <div ref={bottomRef} />
