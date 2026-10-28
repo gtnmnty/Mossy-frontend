@@ -4,7 +4,7 @@ import Image from "next/image";
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowUp, Trash2 } from "lucide-react";
+import { ArrowUp, Brain, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import CodeBlock from "./CodeBlock";
 
@@ -16,6 +16,9 @@ interface Message {
   content: string;
   createdAt: number;
   error?: boolean;
+  // Feature 7: Mossy's reasoning before the answer, shown collapsed. Never sent back to the
+  // backend — streamChat only ever reads {role, content} off a message.
+  thinking?: string;
 }
 
 type Theme = "dark" | "light" | "ocean" | "shore";
@@ -54,18 +57,19 @@ const TOOL_LABELS: Record<string, string> = {
   get_marine_weather: "Checking the waves",
 };
 
-// Feature 3: Streaming: POSTs the history and reads the SSE response as it arrives,
-// calling onDelta for every text chunk and onTool when Mossy starts using a tool.
+// Feature 3 + Feature 7: Streaming: POSTs the history and reads the SSE response as it
+// arrives, calling onThinking for reasoning chunks (only sent when think is true), onDelta
+// for answer text chunks, and onTool when Mossy starts using a tool.
 // (EventSource can't be used: it only supports GET.)
 async function streamChat(
   history: { role: Role; content: string }[],
-  onDelta: (text: string) => void,
-  onTool: (name: string) => void,
+  think: boolean,
+  on: { thinking: (text: string) => void; delta: (text: string) => void; tool: (name: string) => void },
 ) {
   const res = await fetch(`${API_URL}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages: history }),
+    body: JSON.stringify({ messages: history, think }),
   });
   // Validation errors (422) etc. come back as a normal JSON response before any streaming.
   if (!res.ok || !res.body) {
@@ -97,9 +101,11 @@ async function streamChat(
       const data = /^data: (.*)$/m.exec(ev)?.[1];
       if (!data) continue; // keep-alive pings have no data line
 
-      if (name === "delta") onDelta(JSON.parse(data).text);
+      // Feature 7: reasoning arrives before the answer, as its own event type.
+      if (name === "thinking") on.thinking(JSON.parse(data).text);
+      else if (name === "delta") on.delta(JSON.parse(data).text);
       // Feature 5: the server sends "tool" with the tool's name before running it.
-      else if (name === "tool") onTool(JSON.parse(data).name);
+      else if (name === "tool") on.tool(JSON.parse(data).name);
       // The server reports mid-stream failures as an event, not an HTTP status.
       else if (name === "error") throw new Error(JSON.parse(data).message);
       // "done" carries token usage; nothing to do with it yet.
@@ -113,6 +119,7 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [toolStatus, setToolStatus] = useState<string | null>(null);
+  const [think, setThink] = useState(false); // Feature 7: "Think harder" toggle
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -146,17 +153,24 @@ export default function Chat() {
     setLoading(true);
 
     try {
-      await streamChat(
-        history,
-        (chunk) => {
+      await streamChat(history, think, {
+        thinking: (chunk) => {
+          setToolStatus(null);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === botMsg.id ? { ...m, thinking: (m.thinking ?? "") + chunk } : m,
+            ),
+          );
+        },
+        delta: (chunk) => {
           setToolStatus(null);
           // Immutable update: copy the array and replace only the streaming message.
           setMessages((prev) =>
             prev.map((m) => (m.id === botMsg.id ? { ...m, content: m.content + chunk } : m)),
           );
         },
-        (name) => setToolStatus(TOOL_LABELS[name] ?? `Using ${name}`),
-      );
+        tool: (name) => setToolStatus(TOOL_LABELS[name] ?? `Using ${name}`),
+      });
     } catch (err) {
       const reason = err instanceof Error ? err.message : "Unknown error";
       // Fill the existing bubble (keeping any partial text) instead of adding a second one.
@@ -229,8 +243,9 @@ export default function Chat() {
           )}
 
           {messages.map((m) =>
-            // The empty streaming bubble stays hidden; the typing dots below stand in for it.
-            m.role === "assistant" && !m.content ? null : m.role === "user" ? (
+            // The empty streaming bubble stays hidden until thinking or an answer arrives;
+            // the typing dots below stand in for it.
+            m.role === "assistant" && !m.content && !m.thinking ? null : m.role === "user" ? (
               <div key={m.id} className="flex justify-end">
                 <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-accent px-4 py-2.5 text-[15px] text-accent-fg">
                   {m.content}
@@ -245,6 +260,17 @@ export default function Chat() {
                     m.error && "text-red-400",
                   )}
                 >
+                  {/* Feature 7: Mossy's reasoning, closed by default, above its answer. */}
+                  {m.thinking && (
+                    <details className="mb-2 text-sm text-muted">
+                      <summary className="cursor-pointer select-none hover:text-text">
+                        Mossy&apos;s thinking
+                      </summary>
+                      <p className="mt-1.5 whitespace-pre-wrap border-l-2 border-border pl-2.5">
+                        {m.thinking}
+                      </p>
+                    </details>
+                  )}
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
@@ -271,9 +297,11 @@ export default function Chat() {
             ),
           )}
 
-          {/* Dots show only until the first chunk arrives (last message still empty). */}
-          {/* Typing dots before the first words, and again (with a label) while a tool runs. */}
-          {loading && (toolStatus || !messages[messages.length - 1]?.content) && (
+          {/* Typing dots before thinking or the first words arrive, and again (with a
+              label) while a tool runs. */}
+          {loading &&
+            (toolStatus ||
+              (!messages[messages.length - 1]?.content && !messages[messages.length - 1]?.thinking)) && (
             <div className="flex items-start gap-3">
               <Image src="/logo.png" alt="Mossy" width={28} height={28} className="mt-1 shrink-0" />
               <div className="flex items-center gap-1 rounded-2xl rounded-tl-sm bg-surface px-4 py-4">
@@ -293,6 +321,19 @@ export default function Chat() {
       </main>
 
       <footer className="border-t border-border bg-surface px-4 py-3">
+        <div className="mx-auto mb-2 flex w-full max-w-3xl">
+          {/* Feature 7: toggle sent as "think" on every request. */}
+          <label className="flex cursor-pointer select-none items-center gap-1.5 text-sm text-muted hover:text-text">
+            <input
+              type="checkbox"
+              checked={think}
+              onChange={(e) => setThink(e.target.checked)}
+              className="accent-accent"
+            />
+            <Brain size={14} />
+            Think harder
+          </label>
+        </div>
         <form onSubmit={send} className="mx-auto flex w-full max-w-3xl items-end gap-2">
           <textarea
             ref={inputRef}
